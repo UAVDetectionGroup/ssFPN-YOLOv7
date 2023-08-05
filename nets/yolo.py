@@ -3,7 +3,59 @@ import torch
 import torch.nn as nn
 
 from nets.backbone import Backbone, Multi_Concat_Block, Conv, SiLU, Transition_Block, autopad
+from mish_cuda import MishCuda as Mish
 
+class ssfpn_Conv(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+        super(Conv, self).__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = Mish() if act else nn.Identity()
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+    def fuseforward(self, x):
+        return self.act(self.conv(x))
+
+class ssfpn_Unsqueeze(nn.Module):
+    # Concatenate a list of tensors along dimension
+    def __init__(self, dimension=2):
+        super(ssfpn_Unsqueeze, self).__init__()
+        self.d = dimension
+    def forward(self, x):
+        return x.unsqueeze(self.d)
+
+class ssfpn_Concat(nn.Module):
+    # Concatenate a list of tensors along dimension
+    def __init__(self, dimension=1):
+        super(ssfpn_Concat, self).__init__()
+        self.d = dimension
+
+    def forward(self, x):
+        return torch.cat(x, self.d)
+
+class ssfpn_Conv3D(nn.Module):
+    # create sequence feature
+    def __init__(self, in_c=256, out_c=256):
+        super(ssfpn_Conv3D, self).__init__()
+        self.conv3d = nn.Conv3d(in_c, out_c, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=1)
+        self.batch3d = nn.BatchNorm3d(out_c, eps=0.001)
+        self.leakyRelu = nn.LeakyReLU()
+        self.avgpool3d = nn.AdaptiveAvgPool3d((1, None, None))
+        self.flat = ssfpn_Flatten()
+
+
+    def forward(self, x):
+        x = self.conv3d(x)
+        x = self.batch3d(x)
+        x = self.leakyRelu(x)
+        x = self.avgpool3d(x)
+        x = x.squeeze(2)
+        return x
+
+class ssfpn_Flatten(nn.Module):
+    # Use after nn.AdaptiveAvgPool2d(1) to remove last 2 dimensions
+    def forward(x):
+        return x.view(x.size(0), -1)
 
 class SPPCSPC(nn.Module):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
@@ -268,8 +320,25 @@ class YoloBody(nn.Module):
         self.conv3_for_downsample2  = Multi_Concat_Block(transition_channels * 32, panet_channels * 8, transition_channels * 16, e=e, n=n, ids=ids)
         #------------------------加强特征提取网络------------------------# 
 
+
+        # ------------------------ssfpn------------------------#
+        self.ssfpn_conv_for_P5 = Conv(512, 128, 1, 1)
+        self.ssfpn_upsample_for_P5 = nn.Upsample(None, 4, 'nearest')
+        self.ssfpn_conv_for_P4 = Conv(256, 128, 1, 1)
+        self.ssfpn_upsample_for_P4 = nn.Upsample(None, 2, 'nearest')
+
+        self.ssfpn_unsqueeze_for_P5 = ssfpn_Unsqueeze(2)
+        self.ssfpn_unsqueeze_for_P4 = ssfpn_Unsqueeze(2)
+        self.ssfpn_unsqueeze_for_P3 = ssfpn_Unsqueeze(2)
+
+        self.concat_for_P3_P4_P5 = ssfpn_Concat(2)
+        self.conv3d_for_general_view = ssfpn_Conv3D(128, 128)
+        self.concat_for_general_view_P3 = ssfpn_Concat(1)
+
+        # ------------------------ssfpn------------------------#
+
         # 80, 80, 128 => 80, 80, 256
-        self.rep_conv_1 = conv(transition_channels * 4, transition_channels * 8, 3, 1)
+        self.rep_conv_1 = conv(transition_channels * 8, transition_channels * 8, 3, 1)
         # 40, 40, 256 => 40, 40, 512
         self.rep_conv_2 = conv(transition_channels * 8, transition_channels * 16, 3, 1)
         # 20, 20, 512 => 20, 20, 1024
@@ -336,7 +405,24 @@ class YoloBody(nn.Module):
         # P3 80, 80, 128 
         # P4 40, 40, 256
         # P5 20, 20, 512
-        
+
+        # ------------------------ssfpn------------------------#
+        ssfpn_P5 = self.ssfpn_conv_for_P5(P5)
+        ssfpn_P5 = self.ssfpn_upsample_for_P5(ssfpn_P5)
+        ssfpn_P4 = self.ssfpn_conv_for_P4(P4)
+        ssfpn_P4 = self.ssfpn_upsample_for_P4(ssfpn_P4)
+
+        ssfpn_P5 = self.ssfpn_unsqueeze_for_P5(ssfpn_P5)
+        ssfpn_P4 = self.ssfpn_unsqueeze_for_P4(ssfpn_P4)
+        ssfpn_P3 = self.ssfpn_unsqueeze_for_P4(P3)
+
+        general_view = self.concat_for_P3_P4_P5(ssfpn_P3, ssfpn_P4, ssfpn_P5)
+        general_view = self.conv3d_for_general_view(general_view)
+        S2 = self.concat_for_general_view_P3(general_view, P3)
+
+
+        # ------------------------ssfpn------------------------#
+
         P3 = self.rep_conv_1(P3)
         P4 = self.rep_conv_2(P4)
         P5 = self.rep_conv_3(P5)
